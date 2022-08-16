@@ -70,6 +70,36 @@ for (int fid_y = 0; fid_y < filter_size; ++fid_y) {
     }
 }
 ```
+### Alternate load to shared memory
+The block-strided loop approach for loading from global to shared memory is not ideal in that where the x stride is 1, most threads do not need to load and where the y stride is 1, most warps do not need to load (out of bounds). This is not ideal use of the warps and threads, so this method attempts to improve the parallelism by performing the same initial load and then in a second step, dividing the required loads among the available warps. A couple warps will load 32 (warpSize) elements from the remaining rows, while the rest will load two rows (one block stride in x to the right) of a couple elements each. This allows each block to complete the load from global to shared memory in two, rather than 4 steps.
+```c++
+int overall_x = tid_x - padding;
+int overall_y = tid_y - padding;
+unsigned wid = (threadIdx.y * BLOCK_SIZE + threadIdx.x) / warpSize;
+s_input[threadIdx.y * tile_size + threadIdx.x] = (overall_x >= 0 && overall_x < cols && overall_y >= 0 && overall_y < rows) ? \
+            input[overall_y * cols + overall_x] : 0.f;
+
+unsigned num_warps = total_padding + (tile_size + 2 - 1) / 2;  // ceiling division
+if (wid < total_padding) {
+    overall_y += BLOCK_SIZE;
+    if ((BLOCK_SIZE + threadIdx.y) < tile_size && threadIdx.x < tile_size) {
+        s_input[(BLOCK_SIZE + threadIdx.y) * tile_size + threadIdx.x] = (overall_x >= 0 && overall_x < cols && overall_y >= 0 && overall_y < rows) ? \
+            input[overall_y * cols + overall_x] : 0.f;
+    }
+}
+else if (wid < num_warps) {
+    unsigned shared_y = threadIdx.x / 16 + 2 * (wid - total_padding);
+    unsigned shared_x = BLOCK_SIZE + threadIdx.x % total_padding;
+    if (shared_x < tile_size && shared_y < tile_size) {
+        overall_y = blockIdx.y * blockDim.y + shared_y - padding;
+        overall_x = blockIdx.x * blockDim.x + shared_x - padding;
+        s_input[shared_y * tile_size + shared_x] = \
+        (overall_x >= 0 && overall_x < cols && overall_y >= 0 && overall_y < rows) ? input[overall_y * cols + overall_x] : 0.f;
+    }
+}
+__syncthreads();
+```
+Though this method reduces divergent branches and the number of iterations required to load from global memory, it increases the number of cycles spent per instruction and reduces the number of eligible warps per scheduler. The overall compute time is increased by this. 
 
 ## Texture Memory Implementation
 Texture memory is slightly nicer, in that the kernel doesn't have to manage the padding, but reduces performance compared to the shared memory approach (since the shared memory accesses are already fully coalesced). The kernel is the same, except for setting up texture memory and loading from texture instead of shared memory.
